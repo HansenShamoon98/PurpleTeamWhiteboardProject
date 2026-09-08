@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block page_title %}{{ title }}{% endblock %}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-logo"><img src="{{ url_for('static', filename='kuka-logo.png') }}" alt="KUKA"></span>
+      <span class="brand-text">
+        <span class="brand-title">{{ title }}</span>
+        <span class="brand-sub">AMR Fleet Operations</span>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Primary">
+      <a href="/" class="{{ 'active' if request.path == '/' else '' }}">Fleet</a>
+      <a href="/missionStateCallback" class="{{ 'active' if request.path.startswith('/missionStateCallback') else '' }}">Callbacks</a>
+      <a href="/settings" class="{{ 'active' if request.path.startswith('/settings') else '' }}">Settings</a>
+    </nav>
+    <div class="topbar-right">
+      {% block topbar_right %}{% endblock %}
+    </div>
+  </header>
+
+  <main class="page {% block page_class %}{% endblock %}">
+    {% block content %}{% endblock %}
+  </main>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,385 @@
+﻿{% extends "base.html" %}
+
+{% block topbar_right %}
+<span class="endpoint-chip">
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+  Fleet endpoint <code>{{ request_host }}</code>
+</span>
+{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <div>
+    <h1>Fleet Monitor</h1>
+    <p class="page-subtitle">Live status of every AMR reported by the fleet manager. Select a card to inspect the raw payload.</p>
+  </div>
+  <div class="page-actions">
+    <span class="status-pill" id="repeat-status" data-state="stopped" aria-live="polite"><span class="dot"></span><span id="repeat-status-text">Polling stopped</span></span>
+    <button type="button" class="btn btn-primary" id="start-repeat">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+      Start polling
+    </button>
+    <button type="button" class="btn btn-danger" id="stop-repeat" disabled>
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5"/></svg>
+      Stop
+    </button>
+  </div>
+</div>
+
+<div class="stats" id="stats"></div>
+
+<div class="toolbar">
+  <div class="segmented" id="type-filters" role="group" aria-label="Robot type"></div>
+  <p class="toolbar-meta" id="toolbar-meta"></p>
+</div>
+
+<section class="fleet-grid" id="responses" aria-live="polite">
+  <div class="empty">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+    <p class="empty-title">Waiting for robot responses</p>
+    <p>Start polling to begin receiving fleet data.</p>
+  </div>
+</section>
+
+<dialog class="dialog" id="raw-dialog">
+  <div class="dialog-head">
+    <h2 id="raw-title">AMR data</h2>
+    <div class="actions">
+      <button class="btn btn-sm" type="button" id="copy-json">Copy JSON</button>
+      <button class="btn btn-sm btn-ghost" type="button" id="close-dialog">Close</button>
+    </div>
+  </div>
+  <pre id="raw-json"></pre>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const startButton = document.getElementById("start-repeat");
+  const stopButton = document.getElementById("stop-repeat");
+  const statusPill = document.getElementById("repeat-status");
+  const statusText = document.getElementById("repeat-status-text");
+  const responses = document.getElementById("responses");
+  const stats = document.getElementById("stats");
+  const typeFilters = document.getElementById("type-filters");
+  const toolbarMeta = document.getElementById("toolbar-meta");
+  const rawDialog = document.getElementById("raw-dialog");
+  const rawTitle = document.getElementById("raw-title");
+  const rawJson = document.getElementById("raw-json");
+  const closeDialog = document.getElementById("close-dialog");
+  const copyJson = document.getElementById("copy-json");
+  const statusStates = { 1: "off-mapped", 2: "offline", 3: "idle", 4: "executing", 5: "charging", 6: "updating", 7: "error" };
+  const stateLabels = { "off-mapped": "Off-map", offline: "Offline", idle: "Idle", executing: "Executing", charging: "Charging", updating: "Updating", error: "Error" };
+  const modelImages = {
+    "250p": "/static/250p.png",
+    "600p": "/static/600p.avif",
+    "1500p": "/static/1500p.webp",
+    "3000p": "/static/3000p.jpg"
+  };
+  let statusFilter = "all";
+  let typeFilter = "all";
+  let lastUpdated = null;
+  let lastRenderKey = "";
+
+  const escapeHtml = text => String(text).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function robotRecords(items) {
+    const latest = new Map();
+    for (const response of items) {
+      const payload = response.data;
+      const robots = Array.isArray(payload) ? payload : Array.isArray(payload?.data) ? payload.data : [payload];
+      for (const robot of robots) {
+        if (robot && typeof robot === "object" && robot.robotId != null && !latest.has(String(robot.robotId))) {
+          latest.set(String(robot.robotId), { ...robot, _received: response.timestamp, _httpStatus: response.status });
+        }
+      }
+    }
+    return [...latest.values()].sort((a, b) => String(a.robotId).localeCompare(String(b.robotId), undefined, { numeric: true }));
+  }
+
+  function robotState(robot) {
+    const statusText = String(robot.status || "").trim().toLowerCase();
+    const explicitOffline = robot.online === false || robot.isOnline === false || robot.connected === false;
+    if (explicitOffline || statusText === "offline" || statusText === "off" || robot.status === 0) return "offline";
+    if (!String(robot.mapCode || "").trim()) return "off-mapped";
+    if (!(robot._httpStatus >= 200 && robot._httpStatus < 300)) return "error";
+    return statusStates[robot.status] || "error";
+  }
+
+  function isSimulated(robot) {
+    return Number(robot.batteryVoltage) === 0 && Number(robot.leftMotorTemperature) === 0 && Number(robot.rightMotorTemperature) === 0;
+  }
+
+  const value = (v, suffix = "") => (v == null || v === "" ? "—" : `${escapeHtml(v)}${suffix}`);
+
+  function imageFor(robot) {
+    const model = String(robot.robotType || "").toLowerCase().match(/(250p|600p|1500p|3000p)/)?.[1];
+    return modelImages[model] || modelImages["600p"];
+  }
+
+  function showRawData(robot) {
+    const rawRobot = Object.fromEntries(Object.entries(robot).filter(([key]) => !key.startsWith("_")));
+    rawTitle.textContent = `AMR ${robot.robotId} — raw payload`;
+    rawJson.textContent = JSON.stringify(rawRobot, null, 2);
+    copyJson.textContent = "Copy JSON";
+    rawDialog.showModal();
+  }
+
+  function renderStats(robots, states) {
+    const count = state => states.filter(item => item === state).length;
+    const tiles = [
+      ["all", "Total", robots.length],
+      ["idle", "Idle", count("idle")],
+      ["executing", "Executing", count("executing")],
+      ["charging", "Charging", count("charging")],
+      ["error", "Errors", count("error")],
+      ["offline", "Offline", count("offline")],
+      ["off-mapped", "Off-map", count("off-mapped")]
+    ];
+    if (!stats.children.length) {
+      stats.replaceChildren(...tiles.map(([filter, label]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "stat";
+        button.dataset.filter = filter;
+        button.innerHTML = `<span class="stat-label">${label}</span><span class="stat-value">0</span>`;
+        return button;
+      }));
+    }
+    tiles.forEach(([filter, , n], i) => {
+      const button = stats.children[i];
+      setText(button.lastElementChild, n);
+      button.classList.toggle("active", statusFilter === filter);
+      button.setAttribute("aria-pressed", String(statusFilter === filter));
+    });
+  }
+
+  function renderTypeFilters(robots) {
+    const options = [
+      ["all", "All", robots.length],
+      ["real", "Physical", robots.filter(robot => !isSimulated(robot)).length],
+      ["simulated", "Simulated", robots.filter(isSimulated).length]
+    ];
+    if (!typeFilters.children.length) {
+      typeFilters.replaceChildren(...options.map(([filter, label]) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.type = filter;
+        button.innerHTML = `${label}<strong>0</strong>`;
+        return button;
+      }));
+    }
+    options.forEach(([filter, , n], i) => {
+      const button = typeFilters.children[i];
+      setText(button.lastElementChild, n);
+      button.classList.toggle("active", typeFilter === filter);
+      button.setAttribute("aria-pressed", String(typeFilter === filter));
+    });
+  }
+
+  // Only touch the DOM when text actually changes, so nothing repaints needlessly.
+  function setText(node, text) {
+    const next = String(text);
+    if (node.textContent !== next) node.textContent = next;
+  }
+
+  const cards = new Map();
+  const emptyWaiting = `<div class="empty">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+    <p class="empty-title">Waiting for robot responses</p><p>Start polling to begin receiving fleet data.</p></div>`;
+  const emptyFiltered = `<div class="empty"><p class="empty-title">No robots match the current filters</p><p>Try a different status or robot type.</p></div>`;
+
+  function createCard(robot) {
+    const card = document.createElement("article");
+    card.className = "robot-card";
+    card.tabIndex = 0;
+    card.setAttribute("role", "button");
+    card.setAttribute("aria-label", `Show raw JSON for AMR ${robot.robotId}`);
+    card.innerHTML = `
+      <div class="robot-media">
+        <img data-f="image" src="${imageFor(robot)}" alt="${value(robot.robotType)} AMR" loading="lazy">
+        <div class="badges">
+          <span class="badge badge-state" data-f="state"></span>
+          <span class="badge badge-sim" data-f="sim" hidden>Simulated</span>
+        </div>
+      </div>
+      <div class="robot-body">
+        <div class="robot-head">
+          <div>
+            <h2 class="robot-title">AMR ${value(robot.robotId)}</h2>
+            <p class="robot-type" data-f="type"></p>
+          </div>
+          <div class="battery" data-f="battery"><span class="battery-value" data-f="batteryValue"></span><span class="battery-bar" data-f="batteryBar"><i></i></span></div>
+        </div>
+        <dl class="metrics">
+          <div class="metric"><dt>Location</dt><dd data-f="nodeLabel"></dd></div>
+          <div class="metric"><dt>Map</dt><dd data-f="mapCode"></dd></div>
+          <div class="metric"><dt>Position X</dt><dd data-f="x"></dd></div>
+          <div class="metric"><dt>Position Y</dt><dd data-f="y"></dd></div>
+          <div class="metric"><dt>Status code</dt><dd data-f="status"></dd></div>
+          <div class="metric"><dt>HTTP</dt><dd data-f="http"></dd></div>
+        </dl>
+        <p class="robot-message" data-f="message" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg><span data-f="messageText"></span></p>
+        <div class="robot-foot">
+          <span data-f="updated"></span>
+          <span class="link">Raw JSON <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg></span>
+        </div>
+      </div>`;
+    const fields = Object.fromEntries([...card.querySelectorAll("[data-f]")].map(el => [el.dataset.f, el]));
+    const entry = { card, fields, robot };
+    card.addEventListener("click", () => showRawData(entry.robot));
+    card.addEventListener("keydown", event => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        showRawData(entry.robot);
+      }
+    });
+    return entry;
+  }
+
+  function updateCard(entry, robot, state) {
+    const { card, fields } = entry;
+    entry.robot = robot;
+    const sim = isSimulated(robot);
+    const nextClass = `robot-card ${state}${sim ? " simulated" : ""}`;
+    if (card.className !== nextClass) card.className = nextClass;
+
+    const image = imageFor(robot);
+    if (fields.image.getAttribute("src") !== image) fields.image.src = image;
+    setText(fields.state, stateLabels[state] || state);
+    fields.sim.hidden = !sim;
+    setText(fields.type, robot.robotType ?? "—");
+
+    const level = Number(robot.batteryLevel);
+    if (Number.isFinite(level)) {
+      const pct = Math.max(0, Math.min(100, level));
+      setText(fields.batteryValue, `${pct}%`);
+      fields.batteryBar.hidden = false;
+      fields.batteryBar.dataset.level = pct <= 20 ? "low" : pct <= 50 ? "mid" : "high";
+      fields.batteryBar.firstElementChild.style.width = `${pct}%`;
+      fields.battery.title = `Battery ${pct}%`;
+    } else {
+      setText(fields.batteryValue, "—");
+      fields.batteryBar.hidden = true;
+      fields.battery.removeAttribute("title");
+    }
+
+    for (const key of ["nodeLabel", "mapCode", "x", "y", "status"]) {
+      const text = robot[key] == null || robot[key] === "" ? "—" : String(robot[key]);
+      setText(fields[key], text);
+      if (key === "nodeLabel" || key === "mapCode") fields[key].title = text;
+    }
+    setText(fields.http, robot._httpStatus ?? "—");
+
+    const message = String(robot.errorMessage ?? "").trim();
+    fields.message.hidden = !message;
+    setText(fields.messageText, message);
+    setText(fields.updated, `Updated ${robot._received ?? "—"}`);
+  }
+
+  function renderResponses(items) {
+    const robots = robotRecords(items);
+    const states = robots.map(robotState);
+    renderStats(robots, states);
+    renderTypeFilters(robots);
+
+    const visible = robots.filter((robot, i) =>
+      (statusFilter === "all" || statusFilter === states[i])
+      && (typeFilter === "all" || (typeFilter === "simulated") === isSimulated(robot)));
+
+    const meta = robots.length
+      ? `Showing <strong>${visible.length}</strong> of <strong>${robots.length}</strong> robots${lastUpdated ? ` · last update ${escapeHtml(lastUpdated)}` : ""}`
+      : "";
+    if (toolbarMeta.innerHTML !== meta) toolbarMeta.innerHTML = meta;
+
+    if (!visible.length) {
+      const html = robots.length ? emptyFiltered : emptyWaiting;
+      if (responses.innerHTML !== html) responses.innerHTML = html;
+      return;
+    }
+
+    if (responses.querySelector(".empty")) responses.replaceChildren();
+
+    const seen = new Set();
+    let cursor = responses.firstElementChild;
+    for (const robot of visible) {
+      const id = String(robot.robotId);
+      seen.add(id);
+      let entry = cards.get(id);
+      if (!entry) {
+        entry = createCard(robot);
+        cards.set(id, entry);
+      }
+      updateCard(entry, robot, states[robots.indexOf(robot)]);
+      if (entry.card !== cursor) responses.insertBefore(entry.card, cursor);
+      else cursor = cursor.nextElementSibling;
+    }
+    for (const [id, entry] of cards) {
+      if (!seen.has(id)) {
+        entry.card.remove();
+        if (!robots.some(r => String(r.robotId) === id)) cards.delete(id);
+      }
+    }
+  }
+
+  stats.addEventListener("click", event => {
+    const button = event.target.closest("button[data-filter]");
+    if (!button) return;
+    statusFilter = button.dataset.filter;
+    refresh();
+  });
+
+  typeFilters.addEventListener("click", event => {
+    const button = event.target.closest("button[data-type]");
+    if (!button) return;
+    typeFilter = button.dataset.type;
+    refresh();
+  });
+
+  closeDialog.addEventListener("click", () => rawDialog.close());
+  rawDialog.addEventListener("click", event => {
+    if (event.target === rawDialog) rawDialog.close();
+  });
+  copyJson.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(rawJson.textContent);
+      copyJson.textContent = "Copied";
+    } catch {
+      copyJson.textContent = "Copy failed";
+    }
+  });
+
+  async function refresh() {
+    try {
+      const response = await fetch("/api/repeat/status");
+      const data = await response.json();
+      lastUpdated = data.responses[0]?.timestamp ?? lastUpdated;
+      const renderKey = `${statusFilter}|${typeFilter}|${JSON.stringify(data.responses)}`;
+      if (renderKey !== lastRenderKey) {
+        lastRenderKey = renderKey;
+        renderResponses(data.responses);
+      }
+      startButton.disabled = data.running;
+      stopButton.disabled = !data.running;
+      statusPill.dataset.state = data.running ? "running" : "stopped";
+      statusText.textContent = data.running ? "Polling live" : "Polling stopped";
+    } catch {
+      statusPill.dataset.state = "stopped";
+      statusText.textContent = "Server unreachable";
+    }
+  }
+
+  startButton.addEventListener("click", async () => {
+    await fetch("/api/repeat/start", { method: "POST" });
+    await refresh();
+  });
+
+  stopButton.addEventListener("click", async () => {
+    await fetch("/api/repeat/stop", { method: "POST" });
+    await refresh();
+  });
+
+  refresh();
+  setInterval(refresh, 500);
+</script>
+{% endblock %}

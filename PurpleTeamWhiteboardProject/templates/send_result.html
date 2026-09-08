@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block page_title %}{{ title }} · Result{% endblock %}
+{% block page_class %}page-narrow{% endblock %}
+
+{% block content %}
+{% set status_class = 'ok' if status is number and 200 <= status < 300 else ('warn' if status is number and 300 <= status < 500 else 'bad') %}
+<div class="page-header">
+  <div>
+    <h1>Request Result</h1>
+    <p class="page-subtitle">Outcome of the last request sent through the console.</p>
+  </div>
+  <div class="page-actions">
+    <a class="btn" href="/">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg>
+      Back to fleet
+    </a>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Request</h2>
+    <span class="tag tag-status {{ status_class }}">{{ status }}</span>
+  </div>
+  <div class="panel-body">
+    <dl class="kv">
+      <dt>Method</dt><dd><span class="tag tag-method">{{ method | upper }}</span></dd>
+      <dt>URL</dt><dd class="mono">{{ url }}</dd>
+    </dl>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Headers sent</h2></div>
+  <pre>{{ headers | tojson(indent=2) }}</pre>
+</section>
+
+<section class="panel">
+  <div class="panel-head"><h2>Response body</h2></div>
+  <pre>{{ response_text }}</pre>
+</section>
+{% endblock %}
